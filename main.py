@@ -2,9 +2,9 @@ import os
 import sys
 
 from dotenv import load_dotenv
-import google.generativeai as genai
-
-from PySide6.QtCore import QThread, Signal
+from google import genai
+from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -19,30 +19,46 @@ from PySide6.QtWidgets import (
 load_dotenv()
 
 
+class PromptTextEdit(QTextEdit):
+    """Custom QTextEdit that submits on Enter and inserts newline on Shift+Enter."""
+
+    submit_requested = Signal()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Check if Enter/Return was pressed without Shift
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.submit_requested.emit()
+            event.accept()
+        else:
+            # For Shift+Enter or any other key, use default behavior
+            super().keyPressEvent(event)
+
+
 class GeminiWorker(QThread):
     """Runs generate_content() in a background thread to keep the GUI responsive."""
 
     result_ready = Signal(str)
     error_occurred = Signal(str)
+    token_count_updated = Signal(int)
 
-    def __init__(self, model: genai.GenerativeModel, prompt: str) -> None:
+    def __init__(self, chat, prompt: str) -> None:
         super().__init__()
-        self._model = model
+        self._chat = chat
         self._prompt = prompt
 
     def run(self) -> None:
         try:
-            response = self._model.generate_content(self._prompt)
+            response = self._chat.send_message(self._prompt)
+            self.token_count_updated.emit(response.usage_metadata.total_token_count) 
             self.result_ready.emit(response.text)
-        except Exception as exc:  # noqa: BLE001
-            self.error_occurred.emit(str(exc))
+        except Exception as e:
+            self.error_occurred.emit(str(e))
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, model: genai.GenerativeModel) -> None:
+    def __init__(self, chat) -> None:
         super().__init__()
-        self._model = model
-        self._worker: GeminiWorker | None = None
+        self._chat = chat
 
         self.setWindowTitle("Gemini API Playground")
         self.resize(800, 600)
@@ -52,61 +68,82 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         layout.addWidget(QLabel("Prompt:"))
-        self._input = QTextEdit()
+        self._input = PromptTextEdit()
         self._input.setFixedHeight(100)
-        self._input.setPlaceholderText("Enter your prompt here…")
+        self._input.setPlaceholderText("Enter your prompt here (Enter to submit, Shift+Enter for new line)...")
+        self._input.submit_requested.connect(self._on_submit)
         layout.addWidget(self._input)
 
         self._submit_btn = QPushButton("Submit")
         self._submit_btn.clicked.connect(self._on_submit)
         layout.addWidget(self._submit_btn)
 
-        layout.addWidget(QLabel("Response:"))
+        layout.addWidget(QLabel("Chat History:"))
         self._output = QTextEdit()
         self._output.setReadOnly(True)
-        self._output.setPlaceholderText("Response will appear here…")
+        self._output.setPlaceholderText("Chat history will appear here...")
         layout.addWidget(self._output)
+        
+        self._token_label = QLabel("Total tokens used: 0")
+        layout.addWidget(self._token_label)
 
     def _on_submit(self) -> None:
         prompt = self._input.toPlainText().strip()
         if not prompt:
             return
 
-        if self._worker is not None and self._worker.isRunning():
-            return
-
         self._submit_btn.setEnabled(False)
-        self._output.setPlainText("Generating…")
-
-        self._worker = GeminiWorker(self._model, prompt)
-        self._worker.result_ready.connect(self._on_result)
+        
+        # Append user prompt to output
+        if self._output.toPlainText():
+            self._output.append("\n" + "="*80 + "\n")
+        self._output.append(f"User: {prompt}\n")
+        self._output.append("AI: Generating...")
+        
+        # Clear input field
+        self._input.clear()
+        
+        self._worker = GeminiWorker(self._chat, prompt)
+        self._worker.result_ready.connect(self._on_result_ready)
         self._worker.error_occurred.connect(self._on_error)
+        self._worker.token_count_updated.connect(self._on_token_count_updated)
         self._worker.finished.connect(lambda: self._submit_btn.setEnabled(True))
         self._worker.start()
 
-    def _on_result(self, text: str) -> None:
-        self._output.setPlainText(text)
+    def _on_token_count_updated(self, token_count: int) -> None:
+        current_tokens = int(self._token_label.text().split(": ")[1])
+        total_tokens = current_tokens + token_count
+        self._token_label.setText(f"Total tokens used: {total_tokens}")
+
+    def _on_result_ready(self, text: str) -> None:
+        # Remove the "Generating..." placeholder
+        current_text = self._output.toPlainText()
+        if current_text.endswith("AI: Generating..."):
+            current_text = current_text[:-len("Generating...")]
+            self._output.setPlainText(current_text + text)
+        else:
+            self._output.append(text)
 
     def _on_error(self, message: str) -> None:
         self._output.setPlainText("")
         QMessageBox.critical(self, "Error", message)
+        self._submit_btn.setEnabled(True)
 
 
 def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print(
-            "Error: GEMINI_API_KEY is not set. "
-            "Create a .env file based on .env.example.",
+            "Error: GEMINI_API_KEY is not set. Create a .env file based on .env.example.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-
+    # genai.configure(api_key=api_key)
+    client = genai.Client()
+    chat = client.chats.create(model="gemini-3-flash-preview")
     app = QApplication(sys.argv)
-    window = MainWindow(model)
+    window = MainWindow(chat)
     window.show()
     sys.exit(app.exec())
 
